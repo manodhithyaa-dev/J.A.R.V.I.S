@@ -1,0 +1,91 @@
+# ============================
+# J.A.R.V.I.S. Full Stack
+# React + Vite + FastAPI
+# ============================
+
+# Environment variables / Secrets
+.env
+.env.*
+!.env.example
+!.env.*.example
+*.pem
+*.key
+secrets/
+credentials/
+
+# React / Vite / Node.js
+node_modules/
+dist/
+build/
+.vite/
+coverage/
+.nyc_output/
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
+
+# Python / FastAPI
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+ENV/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+.coverage
+htmlcov/
+*.egg-info/
+.eggs/
+wheels/
+
+# J.A.R.V.I.S. Conversation Memory
+memory/
+backend/memory/
+**/memory/sessions/
+
+# Databases
+*.db
+*.sqlite
+*.sqlite3
+*.sqlite-journal
+
+# AI / ML Models and Datasets
+models/
+datasets/
+data/
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.onnx
+*.gguf
+*.bin
+
+# Logs / Temporary Files
+*.log
+logs/
+tmp/
+temp/
+.cache/
+*.tmp
+*.swp
+*.swo
+
+# IDE / Editors
+.vscode/
+.idea/
+*.code-workspace
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# Docker local overrides
+docker-compose.override.yml
+.env.docker
