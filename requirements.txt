@@ -1,0 +1,8 @@
+litellm
+ollama
+python-dotenv
+pydantic
+rich
+httpx
+fastapi
+uvicorn[standard]
