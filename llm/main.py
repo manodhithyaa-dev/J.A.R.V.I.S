@@ -1,4 +1,5 @@
 import os
+import json
 from pathlib import Path
 from typing import Literal
 
@@ -6,6 +7,7 @@ import litellm
 
 from dotenv import load_dotenv
 from fastapi import BackgroundTasks, FastAPI, HTTPException
+from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -39,6 +41,9 @@ app = FastAPI(
     description="LLM inference service powered by LiteLLM",
     version="1.1.0"
 )
+
+# Maximum tokens generated per response.
+MAX_OUTPUT_TOKENS = int(os.getenv("JARVIS_MAX_OUTPUT_TOKENS", "4096"))
 
 # CORS
 origins = [
@@ -439,6 +444,7 @@ async def chat(request: ChatRequest, background_tasks: BackgroundTasks):
         response = await litellm.acompletion(
             messages=messages,
             stream=False,
+            max_tokens=MAX_OUTPUT_TOKENS,
             **config
         )
 
@@ -494,6 +500,161 @@ async def chat(request: ChatRequest, background_tasks: BackgroundTasks):
             status_code=502,
             detail="LLM provider failed to process the request."
         )
+
+
+
+
+# =====================================================
+# STREAMING CHAT API (Server-Sent Events)
+# =====================================================
+
+@app.post("/api/chat/stream")
+async def chat_stream(request: ChatRequest, background_tasks: BackgroundTasks):
+    """
+    Stream model output as SSE events:
+      data: {"type":"token","token":"Hello"}
+      data: {"type":"done","reply":"...","session_id":"...", ...}
+
+    The existing /api/chat endpoint remains unchanged for compatibility.
+    """
+
+    model_reference = request.model or f"{DEFAULT_GROUP}::{DEFAULT_MODEL}"
+    model_data = find_model(model_reference)
+
+    if not model_data:
+        raise HTTPException(status_code=400, detail="Invalid model selection.")
+
+    query = (request.message or "").strip()
+
+    # Accept the latest user message from messages as a fallback.
+    if not query and request.messages:
+        for item in reversed(request.messages):
+            if item.role == "user":
+                query = item.content.strip()
+                break
+
+    if not query:
+        raise HTTPException(status_code=400, detail="Message cannot be empty.")
+
+    try:
+        session = memory.get_or_create_session(request.session_id)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error))
+
+    session_id = session["id"]
+    query_timestamp = now()
+
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    messages.extend(memory.get_messages(session_id))
+    messages.append({"role": "user", "content": query})
+
+    try:
+        config = get_litellm_config(model_reference)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error))
+
+    async def event_stream():
+        collected: list[str] = []
+        finish_reason = None
+
+        try:
+            stream = await litellm.acompletion(
+                messages=messages,
+                stream=True,
+                max_tokens=MAX_OUTPUT_TOKENS,
+                **config,
+            )
+
+            async for chunk in stream:
+
+                if not getattr(chunk, "choices", None):
+                    continue
+
+                choice = chunk.choices[0]
+
+                # Capture why the model stopped generating.
+                if getattr(choice, "finish_reason", None):
+                    finish_reason = choice.finish_reason
+
+                delta = getattr(choice.delta, "content", None)
+
+                if isinstance(delta, str) and delta:
+                    collected.append(delta)
+
+                    event = {
+                        "type": "token",
+                        "token": delta,
+                    }
+
+                    yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+
+            reply = "".join(collected)
+
+            if not reply:
+                raise RuntimeError("The model returned an empty response.")
+
+            truncated = str(finish_reason).lower() in {"length", "max_tokens"}
+
+            print(
+                f"Stream completed | "
+                f"Model: {model_reference} | "
+                f"Finish reason: {finish_reason} | "
+                f"Truncated: {truncated} | "
+                f"Characters: {len(reply)}"
+            )
+
+            was_untitled = session["title"] == DEFAULT_TITLE
+
+            updated_session = memory.add_exchange(
+                session_id,
+                query,
+                reply,
+                query_timestamp,
+            )
+
+            if was_untitled:
+                background_tasks.add_task(
+                    generate_session_title,
+                    session_id,
+                    model_reference,
+                    query,
+                    reply,
+                )
+
+            done_event = {
+                "type": "done",
+                "reply": reply,
+                "model": model_reference,
+                "provider": model_data["provider"],
+                "session_id": session_id,
+                "title": updated_session["title"],
+                "finish_reason": finish_reason,
+                "truncated": truncated,
+            }
+
+            yield f"data: {json.dumps(done_event, ensure_ascii=False)}\n\n"
+
+        except Exception as error:
+
+            print(f"LLM streaming error: {error}")
+
+            error_event = {
+                "type": "error",
+                "error": str(error),
+            }
+
+            yield f"data: {json.dumps(error_event, ensure_ascii=False)}\n\n"
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+        background=background_tasks,
+    )
 
 
 # =====================================================

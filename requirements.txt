@@ -6,3 +6,10 @@ rich
 httpx
 fastapi
 uvicorn[standard]
+trafilatura
+beautifulsoup4
+ddgs
+datasketch
+python-multipart
+mcp[cli]
+requests

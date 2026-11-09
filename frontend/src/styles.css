@@ -125,3 +125,31 @@
   font-size: 9px;
   padding: 3px 5px;
 }
+
+
+/* Browser speech voice selector */
+.voice-select-label {
+  display: block;
+  margin: 13px 0 6px;
+  color: #6c8799;
+  font: 8px 'DM Mono', monospace;
+  letter-spacing: 1px;
+}
+.voice-select {
+  width: 100%;
+  min-width: 0;
+  padding: 9px 30px 9px 10px;
+  color: #d0e0e9;
+  background: #101e2b;
+  border: 1px solid #294657;
+  border-radius: 7px;
+  outline: none;
+  font: 10px 'DM Mono', monospace;
+  color-scheme: dark;
+}
+.voice-select:focus {
+  border-color: #3989a3;
+  box-shadow: 0 0 0 2px #3989a322;
+}
+.voice-select:disabled { opacity: .6; cursor: wait; }
+.voice-select option { background: #101e2b; color: #d0e0e9; }

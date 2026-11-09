@@ -5,7 +5,7 @@ import {
   Headphones, History, Menu, Mic, MicOff, Plus, Radio, Send,
   Settings2, ShieldCheck, Volume2, Wifi, X, Trash2
 } from "lucide-react";
-import { deleteSession, getHealth, getModels, getSession, getSessions, sendChat, type Model } from "./lib/api";
+import { deleteSession, getHealth, getModels, getSession, getSessions, sendChatStream, type Model } from "./lib/api";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 
@@ -54,6 +54,10 @@ export default function App() {
   const [online, setOnline] = useState(false);
   const [busy, setBusy] = useState(false);
   const [voiceEnabled, setVoiceEnabled] = useState(true);
+  const [availableVoices, setAvailableVoices] = useState<SpeechSynthesisVoice[]>([]);
+  const [selectedVoiceURI, setSelectedVoiceURI] = useState(
+    () => window.localStorage.getItem("jarvis-voice-uri") || "",
+  );
   const [listening, setListening] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
@@ -156,6 +160,34 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    if (!("speechSynthesis" in window)) return;
+
+    const loadVoices = () => {
+      const voices = window.speechSynthesis.getVoices();
+      setAvailableVoices(voices);
+
+      // Pick the browser's default voice on first use, without overwriting
+      // a voice the user has already selected.
+      if (!window.localStorage.getItem("jarvis-voice-uri")) {
+        const defaultVoice = voices.find((voice) => voice.default) || voices[0];
+        if (defaultVoice) setSelectedVoiceURI(defaultVoice.voiceURI);
+      }
+    };
+
+    loadVoices();
+    window.speechSynthesis.addEventListener("voiceschanged", loadVoices);
+    return () => {
+      window.speechSynthesis.removeEventListener("voiceschanged", loadVoices);
+    };
+  }, []);
+
+  const chooseVoice = (voiceURI: string) => {
+    setSelectedVoiceURI(voiceURI);
+    window.localStorage.setItem("jarvis-voice-uri", voiceURI);
+    window.speechSynthesis?.cancel();
+  };
+
+  useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages, busy]);
 
@@ -167,16 +199,48 @@ export default function App() {
     [],
   );
 
-  const speak = (text: string) => {
-    if (!voiceEnabled || !("speechSynthesis" in window)) return;
+  const speak = (text: string, force = false) => {
+    if ((!voiceEnabled && !force) || !("speechSynthesis" in window)) return;
 
     window.speechSynthesis.cancel();
 
     const utterance = new SpeechSynthesisUtterance(text);
     utterance.rate = 1;
-    utterance.pitch = 0.92;
+    utterance.pitch = 1;
+    utterance.voice =
+      availableVoices.find((voice) => voice.voiceURI === selectedVoiceURI) ||
+      null;
     utterance.onstart = () => setCore("speaking");
     utterance.onend = () => setCore("standby");
+    utterance.onerror = () => setCore("standby");
+
+    window.speechSynthesis.speak(utterance);
+  };
+
+  // Queue one chunk without cancelling chunks that are already speaking.
+  // Queue one chunk without cancelling chunks that are already speaking.
+  const speakChunk = (text: string) => {
+    const cleanText = text
+      .replace(/```[\s\S]*?```/g, " code block omitted ")
+      .replace(/`([^`]+)`/g, "$1")
+      .replace(/!\[([^\]]*)\]\([^)]*\)/g, "$1")
+      .replace(/\[([^\]]+)\]\([^)]*\)/g, "$1")
+      .replace(/[#>*_~|]/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+
+    if (!voiceEnabled || !cleanText || !("speechSynthesis" in window)) return;
+
+    const utterance = new SpeechSynthesisUtterance(cleanText);
+    utterance.rate = 1;
+    utterance.pitch = 1;
+    utterance.voice =
+      availableVoices.find((voice) => voice.voiceURI === selectedVoiceURI) ||
+      null;
+
+    utterance.onstart = () => setCore("speaking");
+    utterance.onend = () => setCore("standby");
+    utterance.onerror = () => setCore("standby");
 
     window.speechSynthesis.speak(utterance);
   };
@@ -191,38 +255,105 @@ export default function App() {
     setBusy(true);
     setCore("thinking");
 
-    const next: Message[] = [
-      ...messages,
+    // Stop any previous utterance before starting a new request.
+    window.speechSynthesis?.cancel();
+
+    const userMessage: Message = {
+      id: Date.now(),
+      role: "user",
+      content,
+      time: stamp(),
+    };
+
+    const assistantMessageId = Date.now() + 1;
+
+    // Insert an empty assistant bubble immediately. Streamed words fill it.
+    setMessages((previous) => [
+      ...previous,
+      userMessage,
       {
-        id: Date.now(),
-        role: "user",
-        content,
+        id: assistantMessageId,
+        role: "assistant",
+        content: "",
         time: stamp(),
       },
-    ];
-
-    setMessages(next);
+    ]);
 
     try {
-      // Send only the new message. The backend restores prior turns from disk.
-      const result = await sendChat(content, model, sessionId);
+      let visibleReply = "";
+      let pendingWord = "";
+      let pendingSpeech = "";
+
+      const result = await sendChatStream(
+        content,
+        model,
+        sessionId,
+        (token) => {
+          // Hold an unfinished word until its whitespace boundary arrives.
+          // This gives a word-by-word reveal while the model is still generating.
+          pendingWord += token;
+          const boundary = Math.max(
+            pendingWord.lastIndexOf(" "),
+            pendingWord.lastIndexOf("\n"),
+            pendingWord.lastIndexOf("\t"),
+          );
+
+          if (boundary >= 0) {
+            const newlyVisible = pendingWord.slice(0, boundary + 1);
+            visibleReply += newlyVisible;
+            pendingWord = pendingWord.slice(boundary + 1);
+
+            setMessages((previous) =>
+              previous.map((message) =>
+                message.id === assistantMessageId
+                  ? { ...message, content: visibleReply }
+                  : message,
+              ),
+            );
+
+            // Speak while the model is still generating. Queue sentence-sized
+            // chunks so long answers are read continuously, not just at the end.
+            if (voiceEnabled) {
+              pendingSpeech += newlyVisible;
+              const sentenceMatch = pendingSpeech.match(/[.!?;:](?:["')\\]]*)\\s+/);
+              if (sentenceMatch && sentenceMatch.index !== undefined) {
+                const splitAt = sentenceMatch.index + sentenceMatch[0].length;
+                speakChunk(pendingSpeech.slice(0, splitAt));
+                pendingSpeech = pendingSpeech.slice(splitAt);
+              } else if (pendingSpeech.length >= 220) {
+                const splitAt = Math.max(
+                  pendingSpeech.lastIndexOf(" ", 220),
+                  pendingSpeech.lastIndexOf("\\n", 220),
+                );
+                if (splitAt > 0) {
+                  speakChunk(pendingSpeech.slice(0, splitAt));
+                  pendingSpeech = pendingSpeech.slice(splitAt);
+                }
+              }
+            }
+          }
+        },
+      );
+
+      // Flush the final word and any final speech chunk.
+      visibleReply += pendingWord;
+      setMessages((previous) =>
+        previous.map((message) =>
+          message.id === assistantMessageId
+            ? { ...message, content: result.reply }
+            : message,
+        ),
+      );
+
+      // Speak any remaining tail after the final token arrives.
+      if (voiceEnabled && pendingSpeech.trim()) {
+        speakChunk(pendingSpeech);
+      }
 
       setSessionId(result.session_id);
       setSessionTitle(result.title || "Conversation");
-
-      setMessages((previous) => [
-        ...previous,
-        {
-          id: Date.now() + 1,
-          role: "assistant",
-          content: result.reply,
-          time: stamp(),
-        },
-      ]);
-
       void refreshSessions();
-      setCore("standby");
-      speak(result.reply);
+      if (!voiceEnabled) setCore("standby");
     } catch (e) {
       const message =
         e instanceof Error ? e.message : "Unknown connection error";
@@ -481,7 +612,7 @@ export default function App() {
                         </ReactMarkdown>
                       </div>
                       {message.role === "assistant" && (
-                        <button className="speak-btn" onClick={() => speak(message.content)}>
+                        <button className="speak-btn" onClick={() => speak(message.content, true)}>
                           <Volume2 size={13} /> Play response
                         </button>
                       )}
@@ -615,7 +746,22 @@ export default function App() {
                     <i />
                   </button>
                 </div>
-                <div className="voice-note"><Mic size={13} /> Use the microphone to speak to J.A.R.V.I.S.</div>
+                <label className="voice-select-label" htmlFor="jarvis-voice-select">VOICE</label>
+                <select
+                  id="jarvis-voice-select"
+                  className="voice-select"
+                  value={selectedVoiceURI}
+                  onChange={(event) => chooseVoice(event.target.value)}
+                  disabled={!availableVoices.length}
+                >
+                  {!availableVoices.length && <option value="">Loading available voices...</option>}
+                  {availableVoices.map((voice) => (
+                    <option key={voice.voiceURI} value={voice.voiceURI}>
+                      {voice.name} ({voice.lang}){voice.default ? " — Default" : ""}
+                    </option>
+                  ))}
+                </select>
+                <div className="voice-note"><Mic size={13} /> Choose a voice available in your browser or operating system.</div>
               </div>
 
               <div className="rail-card status-card">
